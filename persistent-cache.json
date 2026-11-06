@@ -1,12 +1,12 @@
 {
-  "updatedAt": 1793991679989,
+  "updatedAt": 1793991749863,
   "gps": {
     "lat": 23.8103,
     "lon": 90.4125,
     "alt": 15,
     "mode": "manual",
     "autoJitter": true,
-    "updatedAt": 1793991661627,
+    "updatedAt": 1793991749862,
     "savedLocations": [
       {
         "id": "loc-dhaka",
