@@ -1,0 +1,277 @@
+name: DroidCloud KVM Android Server
+
+on:
+  workflow_dispatch:
+    inputs:
+      android_api:
+        description: 'Android API Level (34 = Android 14, 33 = Android 13)'
+        required: false
+        default: '34'
+      device_profile:
+        description: 'Device hardware profile'
+        required: false
+        default: 'pixel_6'
+      session_id:
+        description: 'Control Plane Session ID'
+        required: false
+        default: 'default-session'
+      callback_url:
+        description: 'Control Plane Callback URL'
+        required: false
+        default: 'https://ais-dev-h2enyvld4mx3s4aqejob4w-340482346090.asia-southeast1.run.app'
+      restore_apks:
+        description: 'Space-separated APK URLs to auto-install on boot'
+        required: false
+        default: ''
+
+permissions:
+  contents: write
+
+jobs:
+  cloud-android-kvm:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 350
+    steps:
+      - name: Enable Hardware KVM Acceleration (/dev/kvm)
+        run: |
+          echo "Checking hardware KVM support on GitHub Runner..."
+          ls -la /dev/kvm
+          sudo chmod 666 /dev/kvm
+          sudo chown root:kvm /dev/kvm
+          echo "KVM permissions configured."
+
+      - name: Install Cloudflared & Dependencies
+        run: |
+          curl -L --output cloudflared.deb https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64.deb
+          sudo dpkg -i cloudflared.deb
+          sudo apt-get update && sudo apt-get install -y adb ffmpeg jq curl
+
+      - name: Start Docker-Android KVM Container (noVNC + ADB)
+        run: |
+          docker run -d \
+            --privileged \
+            --device /dev/kvm \
+            -e EMULATOR_DEVICE="Samsung Galaxy S10" \
+            -e WEB_VNC=true \
+            -p 6080:6080 \
+            -p 5554:5554 \
+            -p 5555:5555 \
+            --name android-kvm \
+            budtmo/docker-android:emulator_14.0
+          echo "Docker-Android container launched."
+
+      - name: Start Remote ADB HTTP Bridge Daemon (:8081)
+        run: |
+          cat << 'EOF' > adb_bridge.mjs
+          import http from 'node:http';
+          import { exec, execFile } from 'node:child_process';
+          import { promisify } from 'node:util';
+          import fs from 'node:fs';
+
+          const execAsync = promisify(exec);
+          const PORT = 8081;
+
+          async function runAdb(cmd) {
+            return execAsync(`docker exec android-kvm adb ${cmd}`, { maxBuffer: 25 * 1024 * 1024 });
+          }
+
+          const server = http.createServer(async (req, res) => {
+            res.setHeader('Access-Control-Allow-Origin', '*');
+            res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
+            res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
+            if (req.method === 'OPTIONS') {
+              res.writeHead(204);
+              res.end();
+              return;
+            }
+
+            const url = new URL(req.url || '/', `http://localhost:${PORT}`);
+
+            try {
+              if (url.pathname === '/health') {
+                const { stdout } = await runAdb('devices');
+                const bootRes = await runAdb('shell getprop sys.boot_completed').catch(() => ({ stdout: '0' }));
+                const androidVer = await runAdb('shell getprop ro.build.version.release').catch(() => ({ stdout: '14' }));
+                res.writeHead(200, { 'Content-Type': 'application/json' });
+                res.end(JSON.stringify({
+                  ok: true,
+                  devices: stdout.trim(),
+                  bootCompleted: bootRes.stdout.trim() === '1',
+                  androidVersion: androidVer.stdout.trim() || '14',
+                  timestamp: Date.now()
+                }));
+                return;
+              }
+
+              if (url.pathname === '/screencap') {
+                const child = execFile('docker', ['exec', 'android-kvm', 'adb', 'exec-out', 'screencap', '-p'], {
+                  encoding: 'buffer',
+                  maxBuffer: 25 * 1024 * 1024
+                }, (err, stdout) => {
+                  if (err || !stdout || stdout.length < 100) {
+                    res.writeHead(503, { 'Content-Type': 'application/json' });
+                    res.end(JSON.stringify({ ok: false, error: 'Screen not ready yet' }));
+                    return;
+                  }
+                  res.writeHead(200, {
+                    'Content-Type': 'image/png',
+                    'Cache-Control': 'no-store'
+                  });
+                  res.end(stdout);
+                });
+                return;
+              }
+
+              if (req.method === 'POST') {
+                let body = '';
+                for await (const chunk of req) body += chunk;
+                const payload = body ? JSON.parse(body) : {};
+
+                if (url.pathname === '/input') {
+                  const { type, x, y, x2, y2, duration = 250, keycode, text } = payload;
+                  if (type === 'tap') {
+                    await runAdb(`shell input tap ${Math.round(x)} ${Math.round(y)}`);
+                  } else if (type === 'swipe') {
+                    await runAdb(`shell input swipe ${Math.round(x)} ${Math.round(y)} ${Math.round(x2)} ${Math.round(y2)} ${Math.round(duration)}`);
+                  } else if (type === 'keyevent') {
+                    await runAdb(`shell input keyevent ${Number(keycode)}`);
+                  } else if (type === 'text' && text) {
+                    const escaped = String(text).replace(/ /g, '%s').replace(/['"\\`$&|;<>()]/g, '');
+                    await runAdb(`shell input text "${escaped}"`);
+                  }
+                  res.writeHead(200, { 'Content-Type': 'application/json' });
+                  res.end(JSON.stringify({ ok: true }));
+                  return;
+                }
+
+                if (url.pathname === '/shell') {
+                  const safeCmd = String(payload.command || 'getprop ro.product.model');
+                  const { stdout, stderr } = await runAdb(`shell ${safeCmd}`);
+                  res.writeHead(200, { 'Content-Type': 'application/json' });
+                  res.end(JSON.stringify({ ok: true, stdout, stderr }));
+                  return;
+                }
+
+                if (url.pathname === '/install-url') {
+                  const apkUrl = String(payload.apkUrl || '');
+                  if (!apkUrl.startsWith('http')) throw new Error('Invalid APK URL');
+                  await execAsync(`curl -L -s -o /tmp/remote.apk "${apkUrl}"`);
+                  await execAsync('docker cp /tmp/remote.apk android-kvm:/tmp/remote.apk');
+                  const { stdout } = await runAdb('install -r /tmp/remote.apk');
+                  res.writeHead(200, { 'Content-Type': 'application/json' });
+                  res.end(JSON.stringify({ ok: true, output: stdout }));
+                  return;
+                }
+
+                if (url.pathname === '/packages') {
+                  const { stdout } = await runAdb('shell pm list packages -3');
+                  const packages = stdout
+                    .split('\n')
+                    .map(line => line.replace('package:', '').trim())
+                    .filter(Boolean);
+                  res.writeHead(200, { 'Content-Type': 'application/json' });
+                  res.end(JSON.stringify({ ok: true, packages }));
+                  return;
+                }
+
+                if (url.pathname === '/launch') {
+                  const pkg = String(payload.packageName || '');
+                  await runAdb(`shell monkey -p ${pkg} -c android.intent.category.LAUNCHER 1`);
+                  res.writeHead(200, { 'Content-Type': 'application/json' });
+                  res.end(JSON.stringify({ ok: true }));
+                  return;
+                }
+              }
+
+              res.writeHead(404, { 'Content-Type': 'application/json' });
+              res.end(JSON.stringify({ error: 'Not found' }));
+            } catch (e) {
+              res.writeHead(500, { 'Content-Type': 'application/json' });
+              res.end(JSON.stringify({ ok: false, error: e.message }));
+            }
+          });
+
+          server.listen(PORT, '0.0.0.0', () => {
+            console.log('ADB HTTP Bridge listening on', PORT);
+          });
+          EOF
+          nohup node adb_bridge.mjs > adb_bridge.log 2>&1 &
+
+      - name: Expose Public HTTPS/WSS Tunnels & Register with Control Plane
+        run: |
+          nohup cloudflared tunnel --no-autoupdate --url http://localhost:6080 > vnc_tunnel.log 2>&1 &
+          nohup cloudflared tunnel --no-autoupdate --url http://localhost:8081 > adb_tunnel.log 2>&1 &
+          sleep 8
+          VNC_URL=""
+          ADB_URL=""
+          for i in {1..20}; do
+            if [ -z "$VNC_URL" ]; then
+              VNC_URL=$(grep -o 'https://[-a-zA-Z0-9]*\.trycloudflare\.com' vnc_tunnel.log | head -n 1 || true)
+            fi
+            if [ -z "$ADB_URL" ]; then
+              ADB_URL=$(grep -o 'https://[-a-zA-Z0-9]*\.trycloudflare\.com' adb_tunnel.log | head -n 1 || true)
+            fi
+            if [ -n "$VNC_URL" ] && [ -n "$ADB_URL" ]; then
+              break
+            fi
+            sleep 2
+          done
+
+          echo "===================================================="
+          echo "LIVE_NOVNC_URL=$VNC_URL"
+          echo "LIVE_ADB_URL=$ADB_URL"
+          echo "===================================================="
+
+          echo "### DroidCloud KVM Android Live Endpoints" >> $GITHUB_STEP_SUMMARY
+          echo "- **Interactive noVNC Stream**: $VNC_URL" >> $GITHUB_STEP_SUMMARY
+          echo "- **Remote ADB Control API**: $ADB_URL" >> $GITHUB_STEP_SUMMARY
+
+          CALLBACK="${{ github.event.inputs.callback_url }}"
+          if [ -n "$CALLBACK" ]; then
+            curl -s -X POST "$CALLBACK/api/session/register-callback" \
+              -H "Content-Type: application/json" \
+              -d "{\"sessionId\":\"${{ github.event.inputs.session_id }}\",\"vncUrl\":\"$VNC_URL\",\"adbUrl\":\"$ADB_URL\",\"status\":\"booting\"}" || true
+          fi
+
+          echo "Waiting for Android OS to finish booting inside KVM..."
+          for i in {1..90}; do
+            BOOT=$(docker exec android-kvm adb shell getprop sys.boot_completed 2>/dev/null | tr -d '\r' || true)
+            if [ "$BOOT" = "1" ]; then
+              echo "Android OS Boot Completed!"
+              docker exec android-kvm adb shell settings put global window_animation_scale 0
+              docker exec android-kvm adb shell settings put global transition_animation_scale 0
+              docker exec android-kvm adb shell settings put global animator_duration_scale 0
+              docker exec android-kvm adb shell input keyevent 82
+              break
+            fi
+            sleep 4
+          done
+
+          if [ -n "$CALLBACK" ]; then
+            curl -s -X POST "$CALLBACK/api/session/register-callback" \
+              -H "Content-Type: application/json" \
+              -d "{\"sessionId\":\"${{ github.event.inputs.session_id }}\",\"vncUrl\":\"$VNC_URL\",\"adbUrl\":\"$ADB_URL\",\"status\":\"ready\"}" || true
+          fi
+
+          # Auto-restore persistent APKs if specified
+          RESTORE_APKS="${{ github.event.inputs.restore_apks }}"
+          if [ -n "$RESTORE_APKS" ]; then
+            for apk in $RESTORE_APKS; do
+              echo "Restoring persistent APK: $apk"
+              curl -L -s -o /tmp/restore.apk "$apk" && docker cp /tmp/restore.apk android-kvm:/tmp/restore.apk && docker exec android-kvm adb install -r /tmp/restore.apk || true
+            done
+          fi
+
+      - name: Maintain Cloud Android Session & Heartbeat
+        run: |
+          CALLBACK="${{ github.event.inputs.callback_url }}"
+          VNC_URL=$(grep -o 'https://[-a-zA-Z0-9]*\.trycloudflare\.com' vnc_tunnel.log | head -n 1 || true)
+          ADB_URL=$(grep -o 'https://[-a-zA-Z0-9]*\.trycloudflare\.com' adb_tunnel.log | head -n 1 || true)
+          while true; do
+            if [ -n "$CALLBACK" ]; then
+              curl -s -X POST "$CALLBACK/api/session/register-callback" \
+                -H "Content-Type: application/json" \
+                -d "{\"sessionId\":\"${{ github.event.inputs.session_id }}\",\"vncUrl\":\"$VNC_URL\",\"adbUrl\":\"$ADB_URL\",\"status\":\"ready\"}" || true
+            fi
+            sleep 30
+          done
