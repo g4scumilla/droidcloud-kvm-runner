@@ -1,5 +1,5 @@
 {
-  "updatedAt": 1793991119927,
+  "updatedAt": 1793991500506,
   "gps": {
     "lat": 23.8103,
     "lon": 90.4125,
@@ -82,6 +82,6 @@
       "installedInCurrentSession": false
     }
   ],
-  "resolution": "1080x2400",
-  "dpi": 420
+  "resolution": "720x1600",
+  "dpi": 300
 }
