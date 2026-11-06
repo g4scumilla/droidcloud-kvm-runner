@@ -26,6 +26,11 @@ on:
 
 permissions:
   contents: write
+  actions: write
+
+concurrency:
+  group: droidcloud-kvm-instance
+  cancel-in-progress: true
 
 jobs:
   cloud-android-kvm:
@@ -42,9 +47,9 @@ jobs:
 
       - name: Install Cloudflared & Dependencies
         run: |
-          curl -L --output cloudflared.deb https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64.deb
+          curl -L -s --output cloudflared.deb https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64.deb
           sudo dpkg -i cloudflared.deb
-          sudo apt-get update && sudo apt-get install -y adb ffmpeg jq curl
+          sudo apt-get update && sudo apt-get install -y adb jq curl
 
       - name: Start Docker-Android KVM Container (noVNC + ADB)
         run: |
@@ -66,7 +71,6 @@ jobs:
           import http from 'node:http';
           import { exec, execFile } from 'node:child_process';
           import { promisify } from 'node:util';
-          import fs from 'node:fs';
 
           const execAsync = promisify(exec);
           const PORT = 8081;
@@ -89,7 +93,7 @@ jobs:
 
             try {
               if (url.pathname === '/health') {
-                const { stdout } = await runAdb('devices');
+                const { stdout } = await runAdb('devices').catch(() => ({ stdout: '' }));
                 const bootRes = await runAdb('shell getprop sys.boot_completed').catch(() => ({ stdout: '0' }));
                 const androidVer = await runAdb('shell getprop ro.build.version.release').catch(() => ({ stdout: '14' }));
                 res.writeHead(200, { 'Content-Type': 'application/json' });
@@ -104,13 +108,13 @@ jobs:
               }
 
               if (url.pathname === '/screencap') {
-                const child = execFile('docker', ['exec', 'android-kvm', 'adb', 'exec-out', 'screencap', '-p'], {
+                execFile('docker', ['exec', 'android-kvm', 'adb', 'exec-out', 'screencap', '-p'], {
                   encoding: 'buffer',
                   maxBuffer: 25 * 1024 * 1024
                 }, (err, stdout) => {
                   if (err || !stdout || stdout.length < 100) {
                     res.writeHead(503, { 'Content-Type': 'application/json' });
-                    res.end(JSON.stringify({ ok: false, error: 'Screen not ready yet' }));
+                    res.end(JSON.stringify({ ok: false, error: 'Android screen warming up...' }));
                     return;
                   }
                   res.writeHead(200, {
@@ -197,14 +201,18 @@ jobs:
           EOF
           nohup node adb_bridge.mjs > adb_bridge.log 2>&1 &
 
-      - name: Expose Public HTTPS/WSS Tunnels & Register with Control Plane
+      - name: Expose Public HTTPS/WSS Tunnels & Publish Endpoints to Repo
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          SESSION_ID: ${{ github.event.inputs.session_id }}
         run: |
           nohup cloudflared tunnel --no-autoupdate --url http://localhost:6080 > vnc_tunnel.log 2>&1 &
           nohup cloudflared tunnel --no-autoupdate --url http://localhost:8081 > adb_tunnel.log 2>&1 &
-          sleep 8
+          sleep 6
           VNC_URL=""
           ADB_URL=""
-          for i in {1..20}; do
+          for i in {1..25}; do
             if [ -z "$VNC_URL" ]; then
               VNC_URL=$(grep -o 'https://[-a-zA-Z0-9]*\.trycloudflare\.com' vnc_tunnel.log | head -n 1 || true)
             fi
@@ -226,34 +234,49 @@ jobs:
           echo "- **Interactive noVNC Stream**: $VNC_URL" >> $GITHUB_STEP_SUMMARY
           echo "- **Remote ADB Control API**: $ADB_URL" >> $GITHUB_STEP_SUMMARY
 
-          CALLBACK="${{ github.event.inputs.callback_url }}"
-          if [ -n "$CALLBACK" ]; then
-            curl -s -X POST "$CALLBACK/api/session/register-callback" \
-              -H "Content-Type: application/json" \
-              -d "{\"sessionId\":\"${{ github.event.inputs.session_id }}\",\"vncUrl\":\"$VNC_URL\",\"adbUrl\":\"$ADB_URL\",\"status\":\"booting\"}" || true
-          fi
+          # Publish live-session.json directly to GitHub repo so Control Plane discovers it immediately
+          publish_state() {
+            local STATUS_VAL="$1"
+            JSON_PAYLOAD=$(jq -n \
+              --arg sid "$SESSION_ID" \
+              --arg vnc "$VNC_URL" \
+              --arg adb "$ADB_URL" \
+              --arg st "$STATUS_VAL" \
+              --arg runId "${{ github.run_id }}" \
+              --arg ts "$(date +%s)" \
+              '{sessionId: $sid, vncUrl: $vnc, adbUrl: $adb, status: $st, runId: $runId, updatedAt: ($ts | tonumber)}')
+            B64_CONTENT=$(echo "$JSON_PAYLOAD" | base64 -w 0)
+            EXISTING_SHA=$(curl -s -H "Authorization: Bearer $GH_TOKEN" "https://api.github.com/repos/$REPO/contents/live-session.json" | jq -r '.sha // empty')
+            if [ -n "$EXISTING_SHA" ]; then
+              curl -s -X PUT -H "Authorization: Bearer $GH_TOKEN" -H "Content-Type: application/json" \
+                "https://api.github.com/repos/$REPO/contents/live-session.json" \
+                -d "{\"message\":\"Update live session ($STATUS_VAL)\",\"content\":\"$B64_CONTENT\",\"sha\":\"$EXISTING_SHA\"}" > /dev/null
+            else
+              curl -s -X PUT -H "Authorization: Bearer $GH_TOKEN" -H "Content-Type: application/json" \
+                "https://api.github.com/repos/$REPO/contents/live-session.json" \
+                -d "{\"message\":\"Publish live session ($STATUS_VAL)\",\"content\":\"$B64_CONTENT\"}" > /dev/null
+            fi
+          }
 
-          echo "Waiting for Android OS to finish booting inside KVM..."
-          for i in {1..90}; do
+          # Immediately publish tunnel URLs so user connects right away!
+          publish_state "ready"
+
+          echo "Waiting for Android OS boot completion in KVM..."
+          for i in {1..75}; do
             BOOT=$(docker exec android-kvm adb shell getprop sys.boot_completed 2>/dev/null | tr -d '\r' || true)
             if [ "$BOOT" = "1" ]; then
               echo "Android OS Boot Completed!"
-              docker exec android-kvm adb shell settings put global window_animation_scale 0
-              docker exec android-kvm adb shell settings put global transition_animation_scale 0
-              docker exec android-kvm adb shell settings put global animator_duration_scale 0
-              docker exec android-kvm adb shell input keyevent 82
+              docker exec android-kvm adb shell settings put global window_animation_scale 0 || true
+              docker exec android-kvm adb shell settings put global transition_animation_scale 0 || true
+              docker exec android-kvm adb shell settings put global animator_duration_scale 0 || true
+              docker exec android-kvm adb shell input keyevent 82 || true
               break
             fi
-            sleep 4
+            sleep 3
           done
 
-          if [ -n "$CALLBACK" ]; then
-            curl -s -X POST "$CALLBACK/api/session/register-callback" \
-              -H "Content-Type: application/json" \
-              -d "{\"sessionId\":\"${{ github.event.inputs.session_id }}\",\"vncUrl\":\"$VNC_URL\",\"adbUrl\":\"$ADB_URL\",\"status\":\"ready\"}" || true
-          fi
+          publish_state "ready"
 
-          # Auto-restore persistent APKs if specified
           RESTORE_APKS="${{ github.event.inputs.restore_apks }}"
           if [ -n "$RESTORE_APKS" ]; then
             for apk in $RESTORE_APKS; do
@@ -262,16 +285,8 @@ jobs:
             done
           fi
 
-      - name: Maintain Cloud Android Session & Heartbeat
+      - name: Maintain Cloud Android Session
         run: |
-          CALLBACK="${{ github.event.inputs.callback_url }}"
-          VNC_URL=$(grep -o 'https://[-a-zA-Z0-9]*\.trycloudflare\.com' vnc_tunnel.log | head -n 1 || true)
-          ADB_URL=$(grep -o 'https://[-a-zA-Z0-9]*\.trycloudflare\.com' adb_tunnel.log | head -n 1 || true)
           while true; do
-            if [ -n "$CALLBACK" ]; then
-              curl -s -X POST "$CALLBACK/api/session/register-callback" \
-                -H "Content-Type: application/json" \
-                -d "{\"sessionId\":\"${{ github.event.inputs.session_id }}\",\"vncUrl\":\"$VNC_URL\",\"adbUrl\":\"$ADB_URL\",\"status\":\"ready\"}" || true
-            fi
-            sleep 30
+            sleep 45
           done
