@@ -1,5 +1,5 @@
 {
-  "updatedAt": 1793991584638,
+  "updatedAt": 1793991621621,
   "gps": {
     "lat": 23.8103,
     "lon": 90.4125,
@@ -58,7 +58,7 @@
       "version": "3.10.1",
       "category": "System & Storage",
       "apkUrl": "https://f-droid.org/repo/com.amaze.filemanager_121.apk",
-      "autoInstallOnBoot": true,
+      "autoInstallOnBoot": false,
       "installedInCurrentSession": false
     },
     {
