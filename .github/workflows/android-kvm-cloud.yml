@@ -51,7 +51,7 @@ jobs:
           sudo curl -L -s https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 -o /usr/local/bin/cloudflared
           sudo chmod +x /usr/local/bin/cloudflared
 
-          echo "3. Starting Remote ADB HTTP Bridge Daemon on :8081..."
+          echo "3. Starting Remote ADB HTTP Bridge Daemon v2 (RAM Frame Cache + Camera Passthrough) on :8081..."
           cat << 'EOF' > adb_bridge.mjs
           import http from 'node:http';
           import { exec, execFile } from 'node:child_process';
@@ -60,6 +60,26 @@ jobs:
 
           const execAsync = promisify(exec);
           const PORT = 8081;
+
+          let latestFrame = null;
+          let isCapturing = false;
+
+          function captureNextFrame() {
+            if (isCapturing) return;
+            isCapturing = true;
+            execFile('docker', ['exec', 'android-kvm', 'adb', 'exec-out', 'screencap', '-p'], {
+              encoding: 'buffer',
+              maxBuffer: 25 * 1024 * 1024,
+              timeout: 4000
+            }, (err, stdout) => {
+              isCapturing = false;
+              if (!err && stdout && stdout.length > 500) {
+                latestFrame = stdout;
+              }
+            });
+          }
+
+          setInterval(captureNextFrame, 450);
 
           async function runAdb(cmd) {
             return execAsync(`docker exec android-kvm adb ${cmd}`, { maxBuffer: 25 * 1024 * 1024 });
@@ -93,12 +113,22 @@ jobs:
                   devices: stdout.trim(),
                   bootCompleted: bootRes.stdout.trim() === '1',
                   androidVersion: androidVer.stdout.trim() || '14',
+                  hasCachedFrame: Boolean(latestFrame),
                   timestamp: Date.now()
                 }));
                 return;
               }
 
               if (url.pathname === '/screencap') {
+                if (latestFrame) {
+                  res.writeHead(200, {
+                    'Content-Type': 'image/png',
+                    'Cache-Control': 'no-store'
+                  });
+                  res.end(latestFrame);
+                  captureNextFrame();
+                  return;
+                }
                 execFile('docker', ['exec', 'android-kvm', 'adb', 'exec-out', 'screencap', '-p'], {
                   encoding: 'buffer',
                   maxBuffer: 25 * 1024 * 1024
@@ -108,6 +138,7 @@ jobs:
                     res.end(JSON.stringify({ ok: false, error: 'Android KVM framebuffer warming up...' }));
                     return;
                   }
+                  latestFrame = stdout;
                   res.writeHead(200, {
                     'Content-Type': 'image/png',
                     'Cache-Control': 'no-store'
@@ -134,14 +165,40 @@ jobs:
                     const escaped = String(text).replace(/ /g, '%s').replace(/['"\\`$&|;<>()]/g, '');
                     await runAdb(`shell input text "${escaped}"`);
                   }
+                  setTimeout(captureNextFrame, 120);
                   res.writeHead(200, { 'Content-Type': 'application/json' });
                   res.end(JSON.stringify({ ok: true }));
                   return;
                 }
 
+                if (url.pathname === '/camera-upload') {
+                  const { imageBase64, openInGallery } = payload;
+                  if (!imageBase64) throw new Error('Missing imageBase64');
+                  const cleanB64 = String(imageBase64).replace(/^data:image\/\w+;base64,/, '');
+                  const buf = Buffer.from(cleanB64, 'base64');
+                  fs.writeFileSync('/tmp/vivo_camera.jpg', buf);
+                  const tsName = `IMG_VIVO_${Date.now()}.jpg`;
+                  await runAdb('shell "mkdir -p /sdcard/DCIM/Camera /sdcard/Pictures"');
+                  await execAsync('docker cp /tmp/vivo_camera.jpg android-kvm:/sdcard/DCIM/Camera/IMG_VIVO_LIVE.jpg');
+                  await execAsync(`docker cp /tmp/vivo_camera.jpg android-kvm:/sdcard/DCIM/Camera/${tsName}`);
+                  await runAdb('shell "am broadcast -a android.intent.action.MEDIA_SCANNER_SCAN_FILE -d file:///sdcard/DCIM/Camera/IMG_VIVO_LIVE.jpg"');
+                  await runAdb(`shell "am broadcast -a android.intent.action.MEDIA_SCANNER_SCAN_FILE -d file:///sdcard/DCIM/Camera/${tsName}"`);
+                  if (openInGallery) {
+                    await runAdb('shell "am start -a android.intent.action.VIEW -t image/jpeg -d content://media/external/images/media"').catch(() => {});
+                  }
+                  setTimeout(captureNextFrame, 250);
+                  res.writeHead(200, { 'Content-Type': 'application/json' });
+                  res.end(JSON.stringify({
+                    ok: true,
+                    savedPath: `/sdcard/DCIM/Camera/${tsName}`,
+                    livePath: '/sdcard/DCIM/Camera/IMG_VIVO_LIVE.jpg'
+                  }));
+                  return;
+                }
+
                 if (url.pathname === '/shell') {
                   const safeCmd = String(payload.command || 'getprop ro.product.model');
-                  const { stdout, stderr } = await runAdb(`shell ${safeCmd}`);
+                  const { stdout, stderr } = await runAdb(`shell ${JSON.stringify(safeCmd)}`);
                   res.writeHead(200, { 'Content-Type': 'application/json' });
                   res.end(JSON.stringify({ ok: true, stdout, stderr }));
                   return;
@@ -187,7 +244,7 @@ jobs:
           });
 
           server.listen(PORT, '0.0.0.0', () => {
-            console.log('ADB HTTP Bridge listening on', PORT);
+            console.log('ADB HTTP Bridge v2 listening on', PORT);
           });
           EOF
           echo "pulling_android_image" > /tmp/droidcloud_stage.txt
@@ -214,14 +271,11 @@ jobs:
 
           echo "LIVE_NOVNC_URL=$VNC_URL"
           echo "LIVE_ADB_URL=$ADB_URL"
-          echo "$VNC_URL" > /tmp/vnc_url.txt
-          echo "$ADB_URL" > /tmp/adb_url.txt
 
           echo "### DroidCloud KVM Android Live Endpoints" >> $GITHUB_STEP_SUMMARY
           echo "- **Interactive noVNC Stream**: $VNC_URL" >> $GITHUB_STEP_SUMMARY
           echo "- **Remote ADB Control API**: $ADB_URL" >> $GITHUB_STEP_SUMMARY
 
-          # Publish live-session.json immediately to repo so client connects in ~15 seconds!
           JSON_PAYLOAD=$(jq -n \
             --arg sid "$SESSION_ID" \
             --arg vnc "$VNC_URL" \
@@ -250,6 +304,8 @@ jobs:
             --device /dev/kvm \
             -e EMULATOR_DEVICE="Samsung Galaxy S10" \
             -e WEB_VNC=true \
+            -e SCREEN_WIDTH=1080 \
+            -e SCREEN_HEIGHT=2340 \
             -p 6080:6080 \
             -p 5554:5554 \
             -p 5555:5555 \
@@ -263,6 +319,7 @@ jobs:
             if [ "$BOOT" = "1" ]; then
               echo "ready" > /tmp/droidcloud_stage.txt
               echo "Android OS Boot Completed!"
+              docker exec android-kvm adb shell "wm size 1080x2400 && wm density 420" || true
               docker exec android-kvm adb shell settings put global window_animation_scale 0 || true
               docker exec android-kvm adb shell settings put global transition_animation_scale 0 || true
               docker exec android-kvm adb shell settings put global animator_duration_scale 0 || true
