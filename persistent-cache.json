@@ -1,5 +1,5 @@
 {
-  "updatedAt": 1793991621621,
+  "updatedAt": 1793991622771,
   "gps": {
     "lat": 23.8103,
     "lon": 90.4125,
@@ -50,16 +50,6 @@
       "apkUrl": "https://github.com/g4scumilla/g4scumilla.github.io/raw/refs/heads/main/Files/Android_App/G4S%20Cash_1.0.1.apk",
       "autoInstallOnBoot": true,
       "installedInCurrentSession": true
-    },
-    {
-      "id": "amaze-file-manager",
-      "name": "Amaze File Manager",
-      "packageName": "com.amaze.filemanager",
-      "version": "3.10.1",
-      "category": "System & Storage",
-      "apkUrl": "https://f-droid.org/repo/com.amaze.filemanager_121.apk",
-      "autoInstallOnBoot": false,
-      "installedInCurrentSession": false
     },
     {
       "id": "termux-terminal",
