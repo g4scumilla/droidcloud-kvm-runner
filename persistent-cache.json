@@ -1,0 +1,87 @@
+{
+  "updatedAt": 1793991119927,
+  "gps": {
+    "lat": 23.8103,
+    "lon": 90.4125,
+    "alt": 15,
+    "mode": "manual",
+    "autoJitter": false,
+    "updatedAt": 1793991072245,
+    "savedLocations": [
+      {
+        "id": "loc-dhaka",
+        "name": "Dhaka Central",
+        "lat": 23.8103,
+        "lon": 90.4125
+      },
+      {
+        "id": "loc-kolkata",
+        "name": "Kolkata Hub",
+        "lat": 22.5726,
+        "lon": 88.3639
+      },
+      {
+        "id": "loc-dubai",
+        "name": "Dubai Marina",
+        "lat": 25.0805,
+        "lon": 55.1403
+      },
+      {
+        "id": "loc-nyc",
+        "name": "New York Times Sq",
+        "lat": 40.758,
+        "lon": -73.9855
+      },
+      {
+        "id": "loc-london",
+        "name": "London Westminster",
+        "lat": 51.5007,
+        "lon": -0.1246
+      }
+    ]
+  },
+  "persistentApks": [
+    {
+      "id": "apk-1793988064165",
+      "name": "G4s",
+      "packageName": "org.custom.apk",
+      "version": "Latest",
+      "category": "Custom URL",
+      "apkUrl": "https://github.com/g4scumilla/g4scumilla.github.io/raw/refs/heads/main/Files/Android_App/G4S%20Cash_1.0.1.apk",
+      "autoInstallOnBoot": true,
+      "installedInCurrentSession": true
+    },
+    {
+      "id": "amaze-file-manager",
+      "name": "Amaze File Manager",
+      "packageName": "com.amaze.filemanager",
+      "version": "3.10.1",
+      "category": "System & Storage",
+      "apkUrl": "https://f-droid.org/repo/com.amaze.filemanager_121.apk",
+      "autoInstallOnBoot": true,
+      "installedInCurrentSession": false
+    },
+    {
+      "id": "termux-terminal",
+      "name": "Termux Linux Environment",
+      "packageName": "com.termux",
+      "version": "0.118.1",
+      "category": "Developer Tools",
+      "apkUrl": "https://f-droid.org/repo/com.termux_118.apk",
+      "autoInstallOnBoot": false,
+      "installedInCurrentSession": false
+    },
+    {
+      "id": "fennec-browser",
+      "name": "Fennec Web Browser",
+      "packageName": "org.mozilla.fennec_fdroid",
+      "version": "128.0",
+      "category": "Internet",
+      "apkUrl": "https://f-droid.org/repo/org.mozilla.fennec_fdroid_1280020.apk",
+      "autoInstallOnBoot": false,
+      "installedInCurrentSession": false
+    }
+  ],
+  "resolution": "1080x2400",
+  "dpi": 420
+}
