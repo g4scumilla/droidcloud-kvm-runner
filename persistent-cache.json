@@ -1,12 +1,12 @@
 {
-  "updatedAt": 1793992967752,
+  "updatedAt": 1793992984390,
   "gps": {
-    "lat": 23.810433,
+    "lat": 13.68855,
     "lon": 90.412739,
     "alt": 15,
     "mode": "manual",
     "autoJitter": false,
-    "updatedAt": 1793992967751,
+    "updatedAt": 1793992984390,
     "savedLocations": [
       {
         "id": "loc-1793992967751",
