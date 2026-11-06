@@ -1,13 +1,19 @@
 {
-  "updatedAt": 1793992918510,
+  "updatedAt": 1793992967752,
   "gps": {
     "lat": 23.810433,
     "lon": 90.412739,
     "alt": 15,
     "mode": "manual",
     "autoJitter": false,
-    "updatedAt": 1793992918510,
+    "updatedAt": 1793992967751,
     "savedLocations": [
+      {
+        "id": "loc-1793992967751",
+        "name": "Yyy",
+        "lat": 23.810433,
+        "lon": 90.412739
+      },
       {
         "id": "loc-dhaka",
         "name": "Dhaka Central",
