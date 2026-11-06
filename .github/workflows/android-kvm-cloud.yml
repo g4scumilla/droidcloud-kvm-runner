@@ -67,6 +67,7 @@ jobs:
 
           let latestFrame = null;
           let latestMime = 'image/jpeg';
+          let latestFrameTime = 0;
           let isCapturing = false;
           let currentGps = {
             lat: Number(process.env.INITIAL_LAT || 23.8103),
@@ -78,29 +79,56 @@ jobs:
           function captureNextFrame() {
             if (isCapturing) return;
             isCapturing = true;
-            // Pipe raw screencap through ffmpeg to produce a tiny ~28KB JPEG in <70ms
-            const child = spawn('sh', [
-              '-c',
-              'docker exec android-kvm adb exec-out screencap -p | ffmpeg -loglevel quiet -f image2pipe -vcodec png -i - -vf "scale=720:-1" -q:v 6 -f singlejpeg -'
-            ]);
-            const chunks = [];
-            const timer = setTimeout(() => {
-              try { child.kill('SIGKILL'); } catch {}
-            }, 3000);
-
-            child.stdout.on('data', (d) => chunks.push(d));
-            child.on('close', (code) => {
-              clearTimeout(timer);
-              isCapturing = false;
-              const buf = Buffer.concat(chunks);
-              if (code === 0 && buf.length > 800) {
-                latestFrame = buf;
-                latestMime = 'image/jpeg';
+            execFile('docker', ['exec', 'android-kvm', 'adb', 'exec-out', 'screencap', '-p'], {
+              encoding: 'buffer',
+              maxBuffer: 25 * 1024 * 1024,
+              timeout: 2500
+            }, (err, pngBuf) => {
+              if (err || !pngBuf || pngBuf.length < 800) {
+                isCapturing = false;
+                return;
               }
-            });
-            child.on('error', () => {
-              clearTimeout(timer);
-              isCapturing = false;
+              const ff = spawn('ffmpeg', [
+                '-loglevel', 'quiet',
+                '-i', 'pipe:0',
+                '-vf', 'scale=720:-1',
+                '-frames:v', '1',
+                '-q:v', '6',
+                '-f', 'mjpeg',
+                'pipe:1'
+              ]);
+              const chunks = [];
+              const timer = setTimeout(() => {
+                try { ff.kill('SIGKILL'); } catch {}
+              }, 1800);
+              ff.stdout.on('data', (d) => chunks.push(d));
+              ff.on('close', (code) => {
+                clearTimeout(timer);
+                isCapturing = false;
+                const jpgBuf = Buffer.concat(chunks);
+                if (code === 0 && jpgBuf.length > 500) {
+                  latestFrame = jpgBuf;
+                  latestMime = 'image/jpeg';
+                  latestFrameTime = Date.now();
+                } else {
+                  latestFrame = pngBuf;
+                  latestMime = 'image/png';
+                  latestFrameTime = Date.now();
+                }
+              });
+              ff.on('error', () => {
+                clearTimeout(timer);
+                isCapturing = false;
+                latestFrame = pngBuf;
+                latestMime = 'image/png';
+                latestFrameTime = Date.now();
+              });
+              try {
+                ff.stdin.write(pngBuf);
+                ff.stdin.end();
+              } catch {
+                isCapturing = false;
+              }
             });
           }
 
@@ -162,7 +190,7 @@ jobs:
               }
 
               if (url.pathname === '/screencap') {
-                if (latestFrame) {
+                if (latestFrame && Date.now() - latestFrameTime < 2000) {
                   res.writeHead(200, {
                     'Content-Type': latestMime,
                     'Cache-Control': 'no-store'
@@ -173,7 +201,8 @@ jobs:
                 }
                 execFile('docker', ['exec', 'android-kvm', 'adb', 'exec-out', 'screencap', '-p'], {
                   encoding: 'buffer',
-                  maxBuffer: 25 * 1024 * 1024
+                  maxBuffer: 25 * 1024 * 1024,
+                  timeout: 2500
                 }, (err, stdout) => {
                   if (err || !stdout || stdout.length < 100) {
                     res.writeHead(503, { 'Content-Type': 'application/json' });
@@ -182,11 +211,13 @@ jobs:
                   }
                   latestFrame = stdout;
                   latestMime = 'image/png';
+                  latestFrameTime = Date.now();
                   res.writeHead(200, {
                     'Content-Type': 'image/png',
                     'Cache-Control': 'no-store'
                   });
                   res.end(stdout);
+                  captureNextFrame();
                 });
                 return;
               }
@@ -423,6 +454,7 @@ jobs:
               echo "ready" > /tmp/droidcloud_stage.txt
               # Set fast 720x1600 (20:9 Vivo Y300 5G ratio) for 3x faster GPU & streaming speed
               docker exec android-kvm adb shell "wm size 720x1600 && wm density 300" || true
+              docker exec android-kvm adb shell "svc power stayon true && settings put system screen_off_timeout 2147483647 && input keyevent 224 && input keyevent 82" || true
               docker exec android-kvm adb shell settings put global window_animation_scale 0 || true
               docker exec android-kvm adb shell settings put global transition_animation_scale 0 || true
               docker exec android-kvm adb shell settings put global animator_duration_scale 0 || true
