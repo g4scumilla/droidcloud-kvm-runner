@@ -37,40 +37,26 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 350
     steps:
-      - name: Enable Hardware KVM Acceleration (/dev/kvm)
+      - name: Enable Hardware KVM & Start Instant Tunnels (15s Fast-Connect)
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          SESSION_ID: ${{ github.event.inputs.session_id }}
         run: |
-          echo "Checking hardware KVM support on GitHub Runner..."
-          ls -la /dev/kvm
+          echo "1. Configuring /dev/kvm hardware virtualization..."
           sudo chmod 666 /dev/kvm
           sudo chown root:kvm /dev/kvm
-          echo "KVM permissions configured."
 
-      - name: Install Cloudflared & Dependencies
-        run: |
-          curl -L -s --output cloudflared.deb https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64.deb
-          sudo dpkg -i cloudflared.deb
-          sudo apt-get update && sudo apt-get install -y adb jq curl
+          echo "2. Installing cloudflared static binary..."
+          sudo curl -L -s https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 -o /usr/local/bin/cloudflared
+          sudo chmod +x /usr/local/bin/cloudflared
 
-      - name: Start Docker-Android KVM Container (noVNC + ADB)
-        run: |
-          docker run -d \
-            --privileged \
-            --device /dev/kvm \
-            -e EMULATOR_DEVICE="Samsung Galaxy S10" \
-            -e WEB_VNC=true \
-            -p 6080:6080 \
-            -p 5554:5554 \
-            -p 5555:5555 \
-            --name android-kvm \
-            budtmo/docker-android:emulator_14.0
-          echo "Docker-Android container launched."
-
-      - name: Start Remote ADB HTTP Bridge Daemon (:8081)
-        run: |
+          echo "3. Starting Remote ADB HTTP Bridge Daemon on :8081..."
           cat << 'EOF' > adb_bridge.mjs
           import http from 'node:http';
           import { exec, execFile } from 'node:child_process';
           import { promisify } from 'node:util';
+          import fs from 'node:fs';
 
           const execAsync = promisify(exec);
           const PORT = 8081;
@@ -93,12 +79,17 @@ jobs:
 
             try {
               if (url.pathname === '/health') {
+                let stage = 'pulling_image';
+                try {
+                  stage = fs.readFileSync('/tmp/droidcloud_stage.txt', 'utf8').trim();
+                } catch {}
                 const { stdout } = await runAdb('devices').catch(() => ({ stdout: '' }));
                 const bootRes = await runAdb('shell getprop sys.boot_completed').catch(() => ({ stdout: '0' }));
                 const androidVer = await runAdb('shell getprop ro.build.version.release').catch(() => ({ stdout: '14' }));
                 res.writeHead(200, { 'Content-Type': 'application/json' });
                 res.end(JSON.stringify({
                   ok: true,
+                  stage,
                   devices: stdout.trim(),
                   bootCompleted: bootRes.stdout.trim() === '1',
                   androidVersion: androidVer.stdout.trim() || '14',
@@ -114,7 +105,7 @@ jobs:
                 }, (err, stdout) => {
                   if (err || !stdout || stdout.length < 100) {
                     res.writeHead(503, { 'Content-Type': 'application/json' });
-                    res.end(JSON.stringify({ ok: false, error: 'Android screen warming up...' }));
+                    res.end(JSON.stringify({ ok: false, error: 'Android KVM framebuffer warming up...' }));
                     return;
                   }
                   res.writeHead(200, {
@@ -199,20 +190,16 @@ jobs:
             console.log('ADB HTTP Bridge listening on', PORT);
           });
           EOF
+          echo "pulling_android_image" > /tmp/droidcloud_stage.txt
           nohup node adb_bridge.mjs > adb_bridge.log 2>&1 &
 
-      - name: Expose Public HTTPS/WSS Tunnels & Publish Endpoints to Repo
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          REPO: ${{ github.repository }}
-          SESSION_ID: ${{ github.event.inputs.session_id }}
-        run: |
+          echo "4. Starting Cloudflare Quick Tunnels (:6080 noVNC and :8081 ADB)..."
           nohup cloudflared tunnel --no-autoupdate --url http://localhost:6080 > vnc_tunnel.log 2>&1 &
           nohup cloudflared tunnel --no-autoupdate --url http://localhost:8081 > adb_tunnel.log 2>&1 &
-          sleep 6
+          sleep 5
           VNC_URL=""
           ADB_URL=""
-          for i in {1..25}; do
+          for i in {1..20}; do
             if [ -z "$VNC_URL" ]; then
               VNC_URL=$(grep -o 'https://[-a-zA-Z0-9]*\.trycloudflare\.com' vnc_tunnel.log | head -n 1 || true)
             fi
@@ -222,49 +209,59 @@ jobs:
             if [ -n "$VNC_URL" ] && [ -n "$ADB_URL" ]; then
               break
             fi
-            sleep 2
+            sleep 1
           done
 
-          echo "===================================================="
           echo "LIVE_NOVNC_URL=$VNC_URL"
           echo "LIVE_ADB_URL=$ADB_URL"
-          echo "===================================================="
+          echo "$VNC_URL" > /tmp/vnc_url.txt
+          echo "$ADB_URL" > /tmp/adb_url.txt
 
           echo "### DroidCloud KVM Android Live Endpoints" >> $GITHUB_STEP_SUMMARY
           echo "- **Interactive noVNC Stream**: $VNC_URL" >> $GITHUB_STEP_SUMMARY
           echo "- **Remote ADB Control API**: $ADB_URL" >> $GITHUB_STEP_SUMMARY
 
-          # Publish live-session.json directly to GitHub repo so Control Plane discovers it immediately
-          publish_state() {
-            local STATUS_VAL="$1"
-            JSON_PAYLOAD=$(jq -n \
-              --arg sid "$SESSION_ID" \
-              --arg vnc "$VNC_URL" \
-              --arg adb "$ADB_URL" \
-              --arg st "$STATUS_VAL" \
-              --arg runId "${{ github.run_id }}" \
-              --arg ts "$(date +%s)" \
-              '{sessionId: $sid, vncUrl: $vnc, adbUrl: $adb, status: $st, runId: $runId, updatedAt: ($ts | tonumber)}')
-            B64_CONTENT=$(echo "$JSON_PAYLOAD" | base64 -w 0)
-            EXISTING_SHA=$(curl -s -H "Authorization: Bearer $GH_TOKEN" "https://api.github.com/repos/$REPO/contents/live-session.json" | jq -r '.sha // empty')
-            if [ -n "$EXISTING_SHA" ]; then
-              curl -s -X PUT -H "Authorization: Bearer $GH_TOKEN" -H "Content-Type: application/json" \
-                "https://api.github.com/repos/$REPO/contents/live-session.json" \
-                -d "{\"message\":\"Update live session ($STATUS_VAL)\",\"content\":\"$B64_CONTENT\",\"sha\":\"$EXISTING_SHA\"}" > /dev/null
-            else
-              curl -s -X PUT -H "Authorization: Bearer $GH_TOKEN" -H "Content-Type: application/json" \
-                "https://api.github.com/repos/$REPO/contents/live-session.json" \
-                -d "{\"message\":\"Publish live session ($STATUS_VAL)\",\"content\":\"$B64_CONTENT\"}" > /dev/null
-            fi
-          }
+          # Publish live-session.json immediately to repo so client connects in ~15 seconds!
+          JSON_PAYLOAD=$(jq -n \
+            --arg sid "$SESSION_ID" \
+            --arg vnc "$VNC_URL" \
+            --arg adb "$ADB_URL" \
+            --arg st "ready" \
+            --arg runId "${{ github.run_id }}" \
+            --arg ts "$(date +%s)" \
+            '{sessionId: $sid, vncUrl: $vnc, adbUrl: $adb, status: $st, runId: $runId, updatedAt: ($ts | tonumber)}')
+          B64_CONTENT=$(echo "$JSON_PAYLOAD" | base64 -w 0)
+          EXISTING_SHA=$(curl -s -H "Authorization: Bearer $GH_TOKEN" "https://api.github.com/repos/$REPO/contents/live-session.json" | jq -r '.sha // empty')
+          if [ -n "$EXISTING_SHA" ]; then
+            curl -s -X PUT -H "Authorization: Bearer $GH_TOKEN" -H "Content-Type: application/json" \
+              "https://api.github.com/repos/$REPO/contents/live-session.json" \
+              -d "{\"message\":\"Publish live KVM tunnels\",\"content\":\"$B64_CONTENT\",\"sha\":\"$EXISTING_SHA\"}" > /dev/null
+          else
+            curl -s -X PUT -H "Authorization: Bearer $GH_TOKEN" -H "Content-Type: application/json" \
+              "https://api.github.com/repos/$REPO/contents/live-session.json" \
+              -d "{\"message\":\"Publish live KVM tunnels\",\"content\":\"$B64_CONTENT\"}" > /dev/null
+          fi
 
-          # Immediately publish tunnel URLs so user connects right away!
-          publish_state "ready"
+      - name: Boot Docker-Android KVM Container & Maintain Session
+        run: |
+          echo "Pulling & starting budtmo/docker-android:emulator_14.0 with /dev/kvm..."
+          docker run -d \
+            --privileged \
+            --device /dev/kvm \
+            -e EMULATOR_DEVICE="Samsung Galaxy S10" \
+            -e WEB_VNC=true \
+            -p 6080:6080 \
+            -p 5554:5554 \
+            -p 5555:5555 \
+            --name android-kvm \
+            budtmo/docker-android:emulator_14.0
 
-          echo "Waiting for Android OS boot completion in KVM..."
-          for i in {1..75}; do
+          echo "booting_android_os" > /tmp/droidcloud_stage.txt
+          echo "Waiting for Android OS to finish booting inside KVM..."
+          for i in {1..90}; do
             BOOT=$(docker exec android-kvm adb shell getprop sys.boot_completed 2>/dev/null | tr -d '\r' || true)
             if [ "$BOOT" = "1" ]; then
+              echo "ready" > /tmp/droidcloud_stage.txt
               echo "Android OS Boot Completed!"
               docker exec android-kvm adb shell settings put global window_animation_scale 0 || true
               docker exec android-kvm adb shell settings put global transition_animation_scale 0 || true
@@ -275,8 +272,6 @@ jobs:
             sleep 3
           done
 
-          publish_state "ready"
-
           RESTORE_APKS="${{ github.event.inputs.restore_apks }}"
           if [ -n "$RESTORE_APKS" ]; then
             for apk in $RESTORE_APKS; do
@@ -285,8 +280,6 @@ jobs:
             done
           fi
 
-      - name: Maintain Cloud Android Session
-        run: |
           while true; do
             sleep 45
           done
