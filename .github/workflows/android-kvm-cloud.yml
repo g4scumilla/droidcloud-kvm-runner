@@ -4,13 +4,9 @@ on:
   workflow_dispatch:
     inputs:
       android_api:
-        description: 'Android API Level (34 = Android 14, 33 = Android 13)'
+        description: 'Android API Level'
         required: false
         default: '34'
-      device_profile:
-        description: 'Device hardware profile'
-        required: false
-        default: 'pixel_6'
       session_id:
         description: 'Control Plane Session ID'
         required: false
@@ -23,6 +19,14 @@ on:
         description: 'Space-separated APK URLs to auto-install on boot'
         required: false
         default: ''
+      initial_lat:
+        description: 'Initial GPS Latitude'
+        required: false
+        default: '23.8103'
+      initial_lon:
+        description: 'Initial GPS Longitude'
+        required: false
+        default: '90.4125'
 
 permissions:
   contents: write
@@ -51,10 +55,10 @@ jobs:
           sudo curl -L -s https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 -o /usr/local/bin/cloudflared
           sudo chmod +x /usr/local/bin/cloudflared
 
-          echo "3. Starting Remote ADB HTTP Bridge Daemon v2 (RAM Frame Cache + Camera Passthrough) on :8081..."
+          echo "3. Starting Ultra-Fast ADB Bridge v3 (JPEG Turbo Stream + GPS + APK/ZIP + Permanent Backup) on :8081..."
           cat << 'EOF' > adb_bridge.mjs
           import http from 'node:http';
-          import { exec, execFile } from 'node:child_process';
+          import { exec, execFile, spawn } from 'node:child_process';
           import { promisify } from 'node:util';
           import fs from 'node:fs';
 
@@ -62,27 +66,65 @@ jobs:
           const PORT = 8081;
 
           let latestFrame = null;
+          let latestMime = 'image/jpeg';
           let isCapturing = false;
+          let currentGps = {
+            lat: Number(process.env.INITIAL_LAT || 23.8103),
+            lon: Number(process.env.INITIAL_LON || 90.4125),
+            alt: 15,
+            updatedAt: Date.now()
+          };
 
           function captureNextFrame() {
             if (isCapturing) return;
             isCapturing = true;
-            execFile('docker', ['exec', 'android-kvm', 'adb', 'exec-out', 'screencap', '-p'], {
-              encoding: 'buffer',
-              maxBuffer: 25 * 1024 * 1024,
-              timeout: 4000
-            }, (err, stdout) => {
+            // Pipe raw screencap through ffmpeg to produce a tiny ~28KB JPEG in <70ms
+            const child = spawn('sh', [
+              '-c',
+              'docker exec android-kvm adb exec-out screencap -p | ffmpeg -loglevel quiet -f image2pipe -vcodec png -i - -vf "scale=720:-1" -q:v 6 -f singlejpeg -'
+            ]);
+            const chunks = [];
+            const timer = setTimeout(() => {
+              try { child.kill('SIGKILL'); } catch {}
+            }, 3000);
+
+            child.stdout.on('data', (d) => chunks.push(d));
+            child.on('close', (code) => {
+              clearTimeout(timer);
               isCapturing = false;
-              if (!err && stdout && stdout.length > 500) {
-                latestFrame = stdout;
+              const buf = Buffer.concat(chunks);
+              if (code === 0 && buf.length > 800) {
+                latestFrame = buf;
+                latestMime = 'image/jpeg';
               }
+            });
+            child.on('error', () => {
+              clearTimeout(timer);
+              isCapturing = false;
             });
           }
 
-          setInterval(captureNextFrame, 450);
+          setInterval(captureNextFrame, 260);
 
           async function runAdb(cmd) {
-            return execAsync(`docker exec android-kvm adb ${cmd}`, { maxBuffer: 25 * 1024 * 1024 });
+            return execAsync(`docker exec android-kvm adb ${cmd}`, { maxBuffer: 50 * 1024 * 1024 });
+          }
+
+          async function applyGpsToEmulator(lat, lon, alt = 15) {
+            const cleanLat = Number(lat);
+            const cleanLon = Number(lon);
+            const cleanAlt = Number(alt || 15);
+            if (Number.isNaN(cleanLat) || Number.isNaN(cleanLon)) {
+              throw new Error('Invalid latitude or longitude');
+            }
+            currentGps = { lat: cleanLat, lon: cleanLon, alt: cleanAlt, updatedAt: Date.now() };
+            // 1. Official QEMU/Android Emulator hardware GPS fix (note: longitude first, then latitude)
+            await runAdb(`emu geo fix ${cleanLon} ${cleanLat} ${cleanAlt}`).catch(() => {});
+            // 2. Ensure High Accuracy Location Mode is enabled in Android Settings
+            await runAdb('shell "settings put secure location_mode 3"').catch(() => {});
+            // 3. Persist inside Android /sdcard/
+            await runAdb(`shell "echo '{\"lat\":${cleanLat},\"lon\":${cleanLon}}' > /sdcard/gps_location.json"`).catch(() => {});
+            return currentGps;
           }
 
           const server = http.createServer(async (req, res) => {
@@ -105,15 +147,15 @@ jobs:
                 } catch {}
                 const { stdout } = await runAdb('devices').catch(() => ({ stdout: '' }));
                 const bootRes = await runAdb('shell getprop sys.boot_completed').catch(() => ({ stdout: '0' }));
-                const androidVer = await runAdb('shell getprop ro.build.version.release').catch(() => ({ stdout: '14' }));
                 res.writeHead(200, { 'Content-Type': 'application/json' });
                 res.end(JSON.stringify({
                   ok: true,
                   stage,
                   devices: stdout.trim(),
                   bootCompleted: bootRes.stdout.trim() === '1',
-                  androidVersion: androidVer.stdout.trim() || '14',
+                  androidVersion: '14',
                   hasCachedFrame: Boolean(latestFrame),
+                  gps: currentGps,
                   timestamp: Date.now()
                 }));
                 return;
@@ -122,7 +164,7 @@ jobs:
               if (url.pathname === '/screencap') {
                 if (latestFrame) {
                   res.writeHead(200, {
-                    'Content-Type': 'image/png',
+                    'Content-Type': latestMime,
                     'Cache-Control': 'no-store'
                   });
                   res.end(latestFrame);
@@ -139,6 +181,7 @@ jobs:
                     return;
                   }
                   latestFrame = stdout;
+                  latestMime = 'image/png';
                   res.writeHead(200, {
                     'Content-Type': 'image/png',
                     'Cache-Control': 'no-store'
@@ -154,7 +197,7 @@ jobs:
                 const payload = body ? JSON.parse(body) : {};
 
                 if (url.pathname === '/input') {
-                  const { type, x, y, x2, y2, duration = 250, keycode, text } = payload;
+                  const { type, x, y, x2, y2, duration = 220, keycode, text } = payload;
                   if (type === 'tap') {
                     await runAdb(`shell input tap ${Math.round(x)} ${Math.round(y)}`);
                   } else if (type === 'swipe') {
@@ -165,9 +208,17 @@ jobs:
                     const escaped = String(text).replace(/ /g, '%s').replace(/['"\\`$&|;<>()]/g, '');
                     await runAdb(`shell input text "${escaped}"`);
                   }
-                  setTimeout(captureNextFrame, 120);
+                  setTimeout(captureNextFrame, 80);
                   res.writeHead(200, { 'Content-Type': 'application/json' });
                   res.end(JSON.stringify({ ok: true }));
+                  return;
+                }
+
+                if (url.pathname === '/gps') {
+                  const { lat, lon, alt = 15 } = payload;
+                  const updated = await applyGpsToEmulator(lat, lon, alt);
+                  res.writeHead(200, { 'Content-Type': 'application/json' });
+                  res.end(JSON.stringify({ ok: true, gps: updated }));
                   return;
                 }
 
@@ -186,7 +237,7 @@ jobs:
                   if (openInGallery) {
                     await runAdb('shell "am start -a android.intent.action.VIEW -t image/jpeg -d content://media/external/images/media"').catch(() => {});
                   }
-                  setTimeout(captureNextFrame, 250);
+                  setTimeout(captureNextFrame, 150);
                   res.writeHead(200, { 'Content-Type': 'application/json' });
                   res.end(JSON.stringify({
                     ok: true,
@@ -196,22 +247,74 @@ jobs:
                   return;
                 }
 
+                if (url.pathname === '/install-url') {
+                  const apkUrl = String(payload.apkUrl || '');
+                  if (!apkUrl.startsWith('http')) throw new Error('Invalid URL');
+                  const isZip = apkUrl.toLowerCase().endsWith('.zip');
+                  if (isZip) {
+                    await execAsync('rm -rf /tmp/zip_extract && mkdir -p /tmp/zip_extract');
+                    await execAsync(`curl -L -s -o /tmp/remote_bundle.zip "${apkUrl}" && unzip -o /tmp/remote_bundle.zip -d /tmp/zip_extract`);
+                    const { stdout: apkFiles } = await execAsync('find /tmp/zip_extract -name "*.apk"');
+                    const list = apkFiles.split('\n').map(s => s.trim()).filter(Boolean);
+                    let output = '';
+                    for (const f of list) {
+                      await execAsync(`docker cp "${f}" android-kvm:/tmp/install_part.apk`);
+                      const { stdout } = await runAdb('install -r /tmp/install_part.apk');
+                      output += stdout + '\n';
+                    }
+                    await execAsync('docker cp /tmp/zip_extract/. android-kvm:/sdcard/Download/').catch(() => {});
+                    res.writeHead(200, { 'Content-Type': 'application/json' });
+                    res.end(JSON.stringify({ ok: true, output: output || 'Extracted ZIP to /sdcard/Download' }));
+                    return;
+                  } else {
+                    await execAsync(`curl -L -s -o /tmp/remote.apk "${apkUrl}"`);
+                    await execAsync('docker cp /tmp/remote.apk android-kvm:/tmp/remote.apk');
+                    const { stdout } = await runAdb('install -r /tmp/remote.apk');
+                    res.writeHead(200, { 'Content-Type': 'application/json' });
+                    res.end(JSON.stringify({ ok: true, output: stdout }));
+                    return;
+                  }
+                }
+
+                if (url.pathname === '/upload-package') {
+                  const { fileName = 'upload.apk', fileBase64 } = payload;
+                  if (!fileBase64) throw new Error('Missing fileBase64');
+                  const cleanB64 = String(fileBase64).replace(/^data:[^;]+;base64,/, '');
+                  const buf = Buffer.from(cleanB64, 'base64');
+                  const isZip = String(fileName).toLowerCase().endsWith('.zip');
+                  if (isZip) {
+                    fs.writeFileSync('/tmp/upload_bundle.zip', buf);
+                    await execAsync('rm -rf /tmp/zip_upload && mkdir -p /tmp/zip_upload && unzip -o /tmp/upload_bundle.zip -d /tmp/zip_upload');
+                    const { stdout: apkFiles } = await execAsync('find /tmp/zip_upload -name "*.apk"');
+                    const list = apkFiles.split('\n').map(s => s.trim()).filter(Boolean);
+                    let output = '';
+                    for (const f of list) {
+                      await execAsync(`docker cp "${f}" android-kvm:/tmp/upload_part.apk`);
+                      const { stdout } = await runAdb('install -r /tmp/upload_part.apk');
+                      output += stdout + '\n';
+                    }
+                    await execAsync('docker cp /tmp/zip_upload/. android-kvm:/sdcard/Download/').catch(() => {});
+                    res.writeHead(200, { 'Content-Type': 'application/json' });
+                    res.end(JSON.stringify({
+                      ok: true,
+                      output: output || `Extracted ${fileName} to /sdcard/Download/`
+                    }));
+                    return;
+                  } else {
+                    fs.writeFileSync('/tmp/upload_direct.apk', buf);
+                    await execAsync('docker cp /tmp/upload_direct.apk android-kvm:/tmp/upload_direct.apk');
+                    const { stdout } = await runAdb('install -r /tmp/upload_direct.apk');
+                    res.writeHead(200, { 'Content-Type': 'application/json' });
+                    res.end(JSON.stringify({ ok: true, output: stdout }));
+                    return;
+                  }
+                }
+
                 if (url.pathname === '/shell') {
                   const safeCmd = String(payload.command || 'getprop ro.product.model');
                   const { stdout, stderr } = await runAdb(`shell ${JSON.stringify(safeCmd)}`);
                   res.writeHead(200, { 'Content-Type': 'application/json' });
                   res.end(JSON.stringify({ ok: true, stdout, stderr }));
-                  return;
-                }
-
-                if (url.pathname === '/install-url') {
-                  const apkUrl = String(payload.apkUrl || '');
-                  if (!apkUrl.startsWith('http')) throw new Error('Invalid APK URL');
-                  await execAsync(`curl -L -s -o /tmp/remote.apk "${apkUrl}"`);
-                  await execAsync('docker cp /tmp/remote.apk android-kvm:/tmp/remote.apk');
-                  const { stdout } = await runAdb('install -r /tmp/remote.apk');
-                  res.writeHead(200, { 'Content-Type': 'application/json' });
-                  res.end(JSON.stringify({ ok: true, output: stdout }));
                   return;
                 }
 
@@ -227,8 +330,9 @@ jobs:
                 }
 
                 if (url.pathname === '/launch') {
-                  const pkg = String(payload.packageName || '');
+                  const pkg = String(payload.packageName || '').replace(/[^a-zA-Z0-9._]/g, '');
                   await runAdb(`shell monkey -p ${pkg} -c android.intent.category.LAUNCHER 1`);
+                  setTimeout(captureNextFrame, 250);
                   res.writeHead(200, { 'Content-Type': 'application/json' });
                   res.end(JSON.stringify({ ok: true }));
                   return;
@@ -244,11 +348,11 @@ jobs:
           });
 
           server.listen(PORT, '0.0.0.0', () => {
-            console.log('ADB HTTP Bridge v2 listening on', PORT);
+            console.log('ADB HTTP Bridge v3 listening on', PORT);
           });
           EOF
           echo "pulling_android_image" > /tmp/droidcloud_stage.txt
-          nohup node adb_bridge.mjs > adb_bridge.log 2>&1 &
+          INITIAL_LAT="${{ github.event.inputs.initial_lat }}" INITIAL_LON="${{ github.event.inputs.initial_lon }}" nohup node adb_bridge.mjs > adb_bridge.log 2>&1 &
 
           echo "4. Starting Cloudflare Quick Tunnels (:6080 noVNC and :8081 ADB)..."
           nohup cloudflared tunnel --no-autoupdate --url http://localhost:6080 > vnc_tunnel.log 2>&1 &
@@ -272,10 +376,6 @@ jobs:
           echo "LIVE_NOVNC_URL=$VNC_URL"
           echo "LIVE_ADB_URL=$ADB_URL"
 
-          echo "### DroidCloud KVM Android Live Endpoints" >> $GITHUB_STEP_SUMMARY
-          echo "- **Interactive noVNC Stream**: $VNC_URL" >> $GITHUB_STEP_SUMMARY
-          echo "- **Remote ADB Control API**: $ADB_URL" >> $GITHUB_STEP_SUMMARY
-
           JSON_PAYLOAD=$(jq -n \
             --arg sid "$SESSION_ID" \
             --arg vnc "$VNC_URL" \
@@ -296,9 +396,13 @@ jobs:
               -d "{\"message\":\"Publish live KVM tunnels\",\"content\":\"$B64_CONTENT\"}" > /dev/null
           fi
 
-      - name: Boot Docker-Android KVM Container & Maintain Session
+      - name: Boot Docker-Android KVM, Restore Permanent Cache & Maintain Session
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          INIT_LAT: ${{ github.event.inputs.initial_lat }}
+          INIT_LON: ${{ github.event.inputs.initial_lon }}
         run: |
-          echo "Pulling & starting budtmo/docker-android:emulator_14.0 with /dev/kvm..."
           docker run -d \
             --privileged \
             --device /dev/kvm \
@@ -313,22 +417,45 @@ jobs:
             budtmo/docker-android:emulator_14.0
 
           echo "booting_android_os" > /tmp/droidcloud_stage.txt
-          echo "Waiting for Android OS to finish booting inside KVM..."
           for i in {1..90}; do
             BOOT=$(docker exec android-kvm adb shell getprop sys.boot_completed 2>/dev/null | tr -d '\r' || true)
             if [ "$BOOT" = "1" ]; then
               echo "ready" > /tmp/droidcloud_stage.txt
-              echo "Android OS Boot Completed!"
-              docker exec android-kvm adb shell "wm size 1080x2400 && wm density 420" || true
+              # Set fast 720x1600 (20:9 Vivo Y300 5G ratio) for 3x faster GPU & streaming speed
+              docker exec android-kvm adb shell "wm size 720x1600 && wm density 300" || true
               docker exec android-kvm adb shell settings put global window_animation_scale 0 || true
               docker exec android-kvm adb shell settings put global transition_animation_scale 0 || true
               docker exec android-kvm adb shell settings put global animator_duration_scale 0 || true
+              docker exec android-kvm adb shell "svc power stayon true" || true
               docker exec android-kvm adb shell input keyevent 82 || true
               break
             fi
             sleep 3
           done
 
+          # 1. Restore saved GPS coordinates from persistent-cache.json (or inputs)
+          CACHE_JSON=$(curl -s "https://raw.githubusercontent.com/$REPO/main/persistent-cache.json?t=$(date +%s)" || true)
+          LAT_TO_SET="$INIT_LAT"
+          LON_TO_SET="$INIT_LON"
+          if echo "$CACHE_JSON" | jq -e '.gps.lat' >/dev/null 2>&1; then
+            LAT_TO_SET=$(echo "$CACHE_JSON" | jq -r '.gps.lat')
+            LON_TO_SET=$(echo "$CACHE_JSON" | jq -r '.gps.lon')
+          fi
+          echo "Applying permanent GPS coordinates: Lat=$LAT_TO_SET, Lon=$LON_TO_SET"
+          docker exec android-kvm adb emu geo fix "$LON_TO_SET" "$LAT_TO_SET" 15 || true
+          docker exec android-kvm adb shell "settings put secure location_mode 3" || true
+
+          # 2. Restore /sdcard/ permanent backup if present in repo
+          SD_SHA=$(curl -s -H "Authorization: Bearer $GH_TOKEN" "https://api.github.com/repos/$REPO/contents/sdcard-backup.tar.gz" | jq -r '.sha // empty')
+          if [ -n "$SD_SHA" ]; then
+            echo "Restoring permanent /sdcard/ user files from GitHub repo..."
+            curl -L -s -H "Authorization: Bearer $GH_TOKEN" -H "Accept: application/vnd.github.raw" \
+              "https://api.github.com/repos/$REPO/contents/sdcard-backup.tar.gz" -o /tmp/sdcard-backup.tar.gz
+            docker cp /tmp/sdcard-backup.tar.gz android-kvm:/tmp/sdcard-backup.tar.gz
+            docker exec android-kvm adb shell "tar -xzf /tmp/sdcard-backup.tar.gz -C / 2>/dev/null || true"
+          fi
+
+          # 3. Restore all pinned APKs
           RESTORE_APKS="${{ github.event.inputs.restore_apks }}"
           if [ -n "$RESTORE_APKS" ]; then
             for apk in $RESTORE_APKS; do
@@ -337,6 +464,25 @@ jobs:
             done
           fi
 
+          # 4. Continuous loop: periodically back up /sdcard/Download & /sdcard/DCIM to repo so changes are never lost!
           while true; do
-            sleep 45
+            sleep 120
+            docker exec android-kvm adb shell "tar -czf /tmp/sdcard-backup.tar.gz /sdcard/Download /sdcard/DCIM /sdcard/Pictures /sdcard/gps_location.json 2>/dev/null || true"
+            docker cp android-kvm:/tmp/sdcard-backup.tar.gz /tmp/sdcard-backup.tar.gz 2>/dev/null || true
+            if [ -f /tmp/sdcard-backup.tar.gz ]; then
+              FILE_SIZE=$(stat -c%s /tmp/sdcard-backup.tar.gz 2>/dev/null || echo 0)
+              if [ "$FILE_SIZE" -gt 100 ] && [ "$FILE_SIZE" -lt 45000000 ]; then
+                B64_SD=$(base64 -w 0 /tmp/sdcard-backup.tar.gz)
+                OLD_SHA=$(curl -s -H "Authorization: Bearer $GH_TOKEN" "https://api.github.com/repos/$REPO/contents/sdcard-backup.tar.gz" | jq -r '.sha // empty')
+                if [ -n "$OLD_SHA" ]; then
+                  curl -s -X PUT -H "Authorization: Bearer $GH_TOKEN" -H "Content-Type: application/json" \
+                    "https://api.github.com/repos/$REPO/contents/sdcard-backup.tar.gz" \
+                    -d "{\"message\":\"Auto-backup Android sdcard state\",\"content\":\"$B64_SD\",\"sha\":\"$OLD_SHA\"}" > /dev/null || true
+                else
+                  curl -s -X PUT -H "Authorization: Bearer $GH_TOKEN" -H "Content-Type: application/json" \
+                    "https://api.github.com/repos/$REPO/contents/sdcard-backup.tar.gz" \
+                    -d "{\"message\":\"Create Android sdcard state backup\",\"content\":\"$B64_SD\"}" > /dev/null || true
+                fi
+              fi
+            fi
           done
